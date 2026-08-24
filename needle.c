@@ -55,6 +55,7 @@ struct needle_context {
     size_t file_size;
     void *mmap_ptr;
     needle_header_t header;
+    const char *vocab_table;
     needle_weights_t weights;
     needle_config_t config;
     grammar_ctx_t gctx;
@@ -339,9 +340,10 @@ needle_context_t *needle_open(const char *filepath, needle_config_t config) {
     /* Verify file boundary safety before setting pointers */
     size_t q_dim = hdr->n_heads * hdr->head_dim;
     size_t kv_dim = hdr->n_kv_heads * hdr->head_dim;
+    size_t vocab_table_bytes = hdr->vocab_size * NEEDLE_VOCAB_TOKEN_SIZE;
 
     size_t per_layer_floats = (hdr->dim * q_dim) + (hdr->dim * kv_dim) + (hdr->dim * kv_dim) + (q_dim * hdr->dim) + (hdr->dim * q_dim) + hdr->head_dim + hdr->head_dim + 1 + 5 * hdr->dim;
-    size_t required_bytes = 128 + (hdr->vocab_size * hdr->dim + hdr->engram_vocab_size * hdr->engram_dim + hdr->n_layers * per_layer_floats + hdr->dim + hdr->dim) * sizeof(float);
+    size_t required_bytes = 128 + vocab_table_bytes + (hdr->vocab_size * hdr->dim + hdr->engram_vocab_size * hdr->engram_dim + hdr->n_layers * per_layer_floats + hdr->dim + hdr->dim) * sizeof(float);
 
     if (file_size < required_bytes) {
         fprintf(stderr, "[Needle 2] Error: Model file binary size (%zu) smaller than required header payload (%zu)\n", file_size, required_bytes);
@@ -351,8 +353,10 @@ needle_context_t *needle_open(const char *filepath, needle_config_t config) {
         return NULL;
     }
 
+    ctx->vocab_table = (const char *)((const uint8_t *)ptr + 128);
+
     /* Set weights pointers directly into mmap memory */
-    const float *curr = (const float *)((const uint8_t *)ptr + 128);
+    const float *curr = (const float *)((const uint8_t *)ptr + 128 + vocab_table_bytes);
     ctx->weights.token_emb = curr;
     curr += hdr->vocab_size * hdr->dim;
 
@@ -439,9 +443,15 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
             rms_norm(norm_x, x, ctx->weights.layers[l].norm_attn, dim);
 
             /* Projections */
-            matmul(q, norm_x, ctx->weights.layers[l].q_proj, dim, q_dim);
-            matmul(k, norm_x, ctx->weights.layers[l].k_proj, dim, kv_dim);
-            matmul(v, norm_x, ctx->weights.layers[l].v_proj, dim, kv_dim);
+            if (ctx->config.backend == NEEDLE_BACKEND_VULKAN && ctx->vulkan_ready) {
+                matmul_vulkan_dispatch(ctx, q, norm_x, ctx->weights.layers[l].q_proj, dim, q_dim);
+                matmul_vulkan_dispatch(ctx, k, norm_x, ctx->weights.layers[l].k_proj, dim, kv_dim);
+                matmul_vulkan_dispatch(ctx, v, norm_x, ctx->weights.layers[l].v_proj, dim, kv_dim);
+            } else {
+                matmul(q, norm_x, ctx->weights.layers[l].q_proj, dim, q_dim);
+                matmul(k, norm_x, ctx->weights.layers[l].k_proj, dim, kv_dim);
+                matmul(v, norm_x, ctx->weights.layers[l].v_proj, dim, kv_dim);
+            }
 
             /* Sliding Window KV Store */
             size_t slot = ctx->cache_pos % NEEDLE_MAX_WINDOW;
@@ -495,7 +505,11 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
             }
 
             /* Output projection */
-            matmul(proj_out, attn_out, ctx->weights.layers[l].o_proj, q_dim, dim);
+            if (ctx->config.backend == NEEDLE_BACKEND_VULKAN && ctx->vulkan_ready) {
+                matmul_vulkan_dispatch(ctx, proj_out, attn_out, ctx->weights.layers[l].o_proj, q_dim, dim);
+            } else {
+                matmul(proj_out, attn_out, ctx->weights.layers[l].o_proj, q_dim, dim);
+            }
             for (size_t i = 0; i < dim; i++) x[i] += proj_out[i];
 
             /* MLP RMSNorm */
@@ -530,7 +544,7 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
         ctx->cache_pos++;
 
         /* Autoregressive generation phase after prompt prefill */
-        if (step >= prompt_len - 1) {
+        if (step >= prompt_len) {
             /* Compute LM Head Logits: dot product of x[dim] with each row b of token_emb[vocab_size, dim] */
             for (size_t b = 0; b < vocab_size; b++) {
                 const float *emb_row = &ctx->weights.token_emb[b * dim];
@@ -574,10 +588,13 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
                 grammar_accept(&ctx->gctx, (uint8_t)best_token);
             }
 
-            current_token = (uint8_t)best_token;
+            current_token = (uint8_t)(best_token & 0xFF);
+            if (gen_count < NEEDLE_MAX_OUTPUT_TOKENS && meta) {
+                meta->token_ids[gen_count] = (uint32_t)best_token;
+            }
             out_buf[gen_count++] = current_token;
 
-            if (gen_count >= max_out_len || current_token == 0) {
+            if (gen_count >= max_out_len || best_token == 0 || best_token == 2) {
                 break;
             }
         }
@@ -601,6 +618,11 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
     free(logits);
 
     return 0;
+}
+
+const char *needle_get_token_str(needle_context_t *ctx, uint32_t token_id) {
+    if (!ctx || !ctx->vocab_table || token_id >= ctx->header.vocab_size) return "";
+    return &ctx->vocab_table[token_id * NEEDLE_VOCAB_TOKEN_SIZE];
 }
 
 void needle_close(needle_context_t *ctx) {

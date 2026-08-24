@@ -49,14 +49,19 @@ typedef struct {
     float top_p;
 } needle_config_t;
 
+#define NEEDLE_VOCAB_TOKEN_SIZE 32
+#define NEEDLE_MAX_OUTPUT_TOKENS 512
+
 typedef struct {
     float confidence;
     size_t generated_tokens;
+    uint32_t token_ids[NEEDLE_MAX_OUTPUT_TOKENS];
 } needle_output_meta_t;
 
 /* Core API Functions */
 needle_context_t *needle_open(const char *filepath, needle_config_t config);
 int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len, uint8_t *out_buf, size_t max_out_len, needle_output_meta_t *meta);
+const char *needle_get_token_str(needle_context_t *ctx, uint32_t token_id);
 void needle_close(needle_context_t *ctx);
 
 #ifdef __cplusplus

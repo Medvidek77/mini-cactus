@@ -77,7 +77,24 @@ int main(int argc, char **argv) {
     double tps = (elapsed_sec > 0.0) ? (meta.generated_tokens / elapsed_sec) : 0.0;
 
     if (res == 0) {
-        printf("[Needle 2] Output: %s\n", (char *)out_buf);
+        printf("[Needle 2] Output (text): ");
+        for (size_t i = 0; i < meta.generated_tokens; i++) {
+            const char *tok_str = needle_get_token_str(ctx, meta.token_ids[i]);
+            if (tok_str && tok_str[0] != '\0') {
+                printf("%s", tok_str);
+            } else {
+                printf("[%u]", meta.token_ids[i]);
+            }
+        }
+        printf("\n");
+
+        printf("[Needle 2] Output (hex): ");
+        for (size_t i = 0; i < meta.generated_tokens && i < 32; i++) {
+            printf("%02x ", out_buf[i]);
+        }
+        if (meta.generated_tokens > 32) printf("...");
+        printf("\n");
+
         printf("[Needle 2] Generated tokens: %zu | Time: %.3fs (%.2f tok/s) | Confidence: %.4f\n",
                meta.generated_tokens, elapsed_sec, tps, meta.confidence);
     } else {

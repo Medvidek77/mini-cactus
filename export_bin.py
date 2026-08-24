@@ -2,7 +2,7 @@
 """
 Needle 2 Model Exporter
 Converts model weights (.pkl / .cact / JAX checkpoint) into contiguous needle2.bin.
-Pure Python standard library implementation.
+Pure Python implementation with optional numpy/pickle loading for real checkpoints.
 """
 
 import os
@@ -19,7 +19,7 @@ def generate_floats(count, scale=0.02, offset=0.0):
 def pack_floats(arr):
     return struct.pack(f"<{len(arr)}f", *arr)
 
-def generate_dummy_weights(output_bin="needle2.bin", dim=512, n_layers=4, n_heads=8, n_kv_heads=4, head_dim=64, vocab_size=8192, engram_vocab_size=8192, engram_dim=128):
+def generate_dummy_weights(output_bin="needle2.bin", dim=512, n_layers=27, n_heads=8, n_kv_heads=4, head_dim=64, vocab_size=8192, engram_vocab_size=8192, engram_dim=128):
     max_seq_len = 2048
     header = struct.pack(
         "<4sIIIIIIIIII",
@@ -42,6 +42,11 @@ def generate_dummy_weights(output_bin="needle2.bin", dim=512, n_layers=4, n_head
             f.write(pack_floats(generate_floats(dim * kv_dim)))
             f.write(pack_floats(generate_floats(dim * kv_dim)))
             f.write(pack_floats(generate_floats(q_dim * dim)))
+            f.write(pack_floats(generate_floats(dim * q_dim)))
+
+            f.write(pack_floats([1.0] * head_dim))
+            f.write(pack_floats([1.0] * head_dim))
+            f.write(pack_floats([1.0]))
 
             f.write(pack_floats([1.0] * dim))
             f.write(pack_floats([1.0] * dim))
@@ -107,7 +112,7 @@ def export_checkpoint(pkl_path, output_bin="needle2.bin"):
         f.write(pack(emb))
 
         # 2. Engram Hash Tables [8192, 128]
-        engram = params["engrams_0"]["embedding"][0]
+        engram = params.get("engrams_0", {}).get("embedding", np.zeros((4, engram_vocab_size, engram_dim)))[0]
         f.write(pack(engram))
 
         # 3. Layer weights
@@ -117,12 +122,39 @@ def export_checkpoint(pkl_path, output_bin="needle2.bin"):
             f.write(pack(self_attn["v_proj"]["kernel"][i]))
             f.write(pack(self_attn["out_proj"]["kernel"][i]))
 
+            if "gate_proj" in self_attn:
+                f.write(pack(self_attn["gate_proj"]["kernel"][i]))
+            else:
+                f.write(pack(np.ones((dim, n_heads * head_dim), dtype=np.float32)))
+
+            if "q_norm" in self_attn:
+                f.write(pack(self_attn["q_norm"]["scale"][i]))
+            else:
+                f.write(pack(np.ones(head_dim, dtype=np.float32)))
+
+            if "k_norm" in self_attn:
+                f.write(pack(self_attn["k_norm"]["scale"][i]))
+            else:
+                f.write(pack(np.ones(head_dim, dtype=np.float32)))
+
+            if "attn_gate" in block:
+                f.write(pack(block["attn_gate"][i]))
+            else:
+                f.write(pack(np.array([1.0], dtype=np.float32)))
+
             f.write(pack(mlp["d1"][i]))
             f.write(pack(mlp["d2"][i]))
             f.write(pack(mlp["d3"][i]))
 
-            f.write(pack(block["pre_hada_norm"]["scale"][i]))
-            f.write(pack(block["post_attn_norm"]["scale"][i]))
+            if "pre_hada_norm" in block:
+                f.write(pack(block["pre_hada_norm"]["scale"][i]))
+            else:
+                f.write(pack(np.ones(dim, dtype=np.float32)))
+
+            if "post_attn_norm" in block:
+                f.write(pack(block["post_attn_norm"]["scale"][i]))
+            else:
+                f.write(pack(np.ones(dim, dtype=np.float32)))
 
         # 4. Final Norm
         f.write(pack(stack["final_norm"]["scale"]))

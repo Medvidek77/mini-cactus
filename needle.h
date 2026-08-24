@@ -45,6 +45,8 @@ typedef struct {
     needle_backend_t backend;
     bool enable_grammar;
     const char *json_schema;
+    float temperature;
+    float top_p;
 } needle_config_t;
 
 typedef struct {

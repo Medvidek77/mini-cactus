@@ -36,6 +36,10 @@ typedef struct {
         const float *k_proj;
         const float *v_proj;
         const float *o_proj;
+        const float *gate_proj;
+        const float *q_norm;
+        const float *k_norm;
+        const float *attn_gate;
         const float *mlp_d1;
         const float *mlp_d2;
         const float *mlp_d3;
@@ -336,10 +340,8 @@ needle_context_t *needle_open(const char *filepath, needle_config_t config) {
     size_t q_dim = hdr->n_heads * hdr->head_dim;
     size_t kv_dim = hdr->n_kv_heads * hdr->head_dim;
 
-    size_t required_bytes = 128 +
-        (hdr->vocab_size * hdr->dim + hdr->engram_vocab_size * hdr->engram_dim) * sizeof(float) +
-        hdr->n_layers * (hdr->dim * q_dim + hdr->dim * kv_dim + hdr->dim * kv_dim + q_dim * hdr->dim + 5 * hdr->dim) * sizeof(float) +
-        (hdr->dim + hdr->dim) * sizeof(float);
+    size_t per_layer_floats = (hdr->dim * q_dim) + (hdr->dim * kv_dim) + (hdr->dim * kv_dim) + (q_dim * hdr->dim) + (hdr->dim * q_dim) + hdr->head_dim + hdr->head_dim + 1 + 5 * hdr->dim;
+    size_t required_bytes = 128 + (hdr->vocab_size * hdr->dim + hdr->engram_vocab_size * hdr->engram_dim + hdr->n_layers * per_layer_floats + hdr->dim + hdr->dim) * sizeof(float);
 
     if (file_size < required_bytes) {
         fprintf(stderr, "[Needle 2] Error: Model file binary size (%zu) smaller than required header payload (%zu)\n", file_size, required_bytes);
@@ -364,6 +366,11 @@ needle_context_t *needle_open(const char *filepath, needle_config_t config) {
         ctx->weights.layers[l].k_proj = curr; curr += hdr->dim * kv_dim;
         ctx->weights.layers[l].v_proj = curr; curr += hdr->dim * kv_dim;
         ctx->weights.layers[l].o_proj = curr; curr += q_dim * hdr->dim;
+        ctx->weights.layers[l].gate_proj = curr; curr += hdr->dim * q_dim;
+
+        ctx->weights.layers[l].q_norm = curr; curr += hdr->head_dim;
+        ctx->weights.layers[l].k_norm = curr; curr += hdr->head_dim;
+        ctx->weights.layers[l].attn_gate = curr; curr += 1;
 
         ctx->weights.layers[l].mlp_d1 = curr; curr += hdr->dim;
         ctx->weights.layers[l].mlp_d2 = curr; curr += hdr->dim;

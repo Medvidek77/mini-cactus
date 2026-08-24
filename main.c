@@ -22,6 +22,7 @@ int main(int argc, char **argv) {
     const char *model_path = "needle2.bin";
     const char *prompt_text = "Hello Needle 2";
     const char *schema = NULL;
+    float temperature = 0.0f;
     needle_backend_t backend = NEEDLE_BACKEND_CPU;
 
     for (int i = 1; i < argc; i++) {
@@ -36,6 +37,8 @@ int main(int argc, char **argv) {
             } else {
                 backend = NEEDLE_BACKEND_CPU;
             }
+        } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
+            temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--json-schema") == 0 && i + 1 < argc) {
             schema = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -47,7 +50,9 @@ int main(int argc, char **argv) {
     needle_config_t config = {
         .backend = backend,
         .enable_grammar = (schema != NULL),
-        .json_schema = schema
+        .json_schema = schema,
+        .temperature = temperature,
+        .top_p = 0.9f
     };
 
     printf("[Needle 2] Opening model '%s' (backend: %s)...\n",

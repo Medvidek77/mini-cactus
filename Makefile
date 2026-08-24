@@ -35,6 +35,6 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET) needle2.bin
+	rm -f $(OBJS) $(TARGET)
 
 .PHONY: all clean

@@ -36,9 +36,9 @@ typedef struct {
         const float *k_proj;
         const float *v_proj;
         const float *o_proj;
-        const float *mlp_gate;
-        const float *mlp_up;
-        const float *mlp_down;
+        const float *mlp_d1;
+        const float *mlp_d2;
+        const float *mlp_d3;
         const float *norm_attn;
         const float *norm_mlp;
     } *layers;
@@ -141,44 +141,73 @@ static inline void matmul_vulkan_dispatch(needle_context_t *ctx, float *out, con
 }
 
 static inline void matmul(float *out, const float *x, const float *w, size_t in_dim, size_t out_dim) {
-    /* out = x * w  where x is [in_dim], w is [in_dim, out_dim] */
+    /* High-performance unrolled matrix-vector multiplication out = x * w */
     memset(out, 0, out_dim * sizeof(float));
 
 #if defined(__AVX2__)
     for (size_t i = 0; i < in_dim; i++) {
         float xi = x[i];
         __m256 vxi = _mm256_set1_ps(xi);
+        const float *w_row = &w[i * out_dim];
         size_t j = 0;
+
+        for (; j + 31 < out_dim; j += 32) {
+            __m256 vo0 = _mm256_loadu_ps(&out[j]);
+            __m256 vo1 = _mm256_loadu_ps(&out[j + 8]);
+            __m256 vo2 = _mm256_loadu_ps(&out[j + 16]);
+            __m256 vo3 = _mm256_loadu_ps(&out[j + 24]);
+
+            vo0 = _mm256_fmadd_ps(vxi, _mm256_loadu_ps(&w_row[j]), vo0);
+            vo1 = _mm256_fmadd_ps(vxi, _mm256_loadu_ps(&w_row[j + 8]), vo1);
+            vo2 = _mm256_fmadd_ps(vxi, _mm256_loadu_ps(&w_row[j + 16]), vo2);
+            vo3 = _mm256_fmadd_ps(vxi, _mm256_loadu_ps(&w_row[j + 24]), vo3);
+
+            _mm256_storeu_ps(&out[j], vo0);
+            _mm256_storeu_ps(&out[j + 8], vo1);
+            _mm256_storeu_ps(&out[j + 16], vo2);
+            _mm256_storeu_ps(&out[j + 24], vo3);
+        }
         for (; j + 7 < out_dim; j += 8) {
-            __m256 vw = _mm256_loadu_ps(&w[i * out_dim + j]);
             __m256 vo = _mm256_loadu_ps(&out[j]);
-            vo = _mm256_fmadd_ps(vxi, vw, vo);
+            vo = _mm256_fmadd_ps(vxi, _mm256_loadu_ps(&w_row[j]), vo);
             _mm256_storeu_ps(&out[j], vo);
         }
         for (; j < out_dim; j++) {
-            out[j] += xi * w[i * out_dim + j];
+            out[j] += xi * w_row[j];
         }
     }
 #elif defined(__ARM_NEON) || defined(__ARM_NEON__)
     for (size_t i = 0; i < in_dim; i++) {
         float xi = x[i];
         float32x4_t vxi = vdupq_n_f32(xi);
+        const float *w_row = &w[i * out_dim];
         size_t j = 0;
-        for (; j + 3 < out_dim; j += 4) {
-            float32x4_t vw = vld1q_f32(&w[i * out_dim + j]);
-            float32x4_t vo = vld1q_f32(&out[j]);
-            vo = vmlaq_f32(vo, vxi, vw);
-            vst1q_f32(&out[j], vo);
+        for (; j + 15 < out_dim; j += 16) {
+            float32x4_t vo0 = vld1q_f32(&out[j]);
+            float32x4_t vo1 = vld1q_f32(&out[j + 4]);
+            float32x4_t vo2 = vld1q_f32(&out[j + 8]);
+            float32x4_t vo3 = vld1q_f32(&out[j + 12]);
+
+            vo0 = vmlaq_f32(vo0, vxi, vld1q_f32(&w_row[j]));
+            vo1 = vmlaq_f32(vo1, vxi, vld1q_f32(&w_row[j + 4]));
+            vo2 = vmlaq_f32(vo2, vxi, vld1q_f32(&w_row[j + 8]));
+            vo3 = vmlaq_f32(vo3, vxi, vld1q_f32(&w_row[j + 12]));
+
+            vst1q_f32(&out[j], vo0);
+            vst1q_f32(&out[j + 4], vo1);
+            vst1q_f32(&out[j + 8], vo2);
+            vst1q_f32(&out[j + 12], vo3);
         }
         for (; j < out_dim; j++) {
-            out[j] += xi * w[i * out_dim + j];
+            out[j] += xi * w_row[j];
         }
     }
 #else
     for (size_t i = 0; i < in_dim; i++) {
         float xi = x[i];
+        const float *w_row = &w[i * out_dim];
         for (size_t j = 0; j < out_dim; j++) {
-            out[j] += xi * w[i * out_dim + j];
+            out[j] += xi * w_row[j];
         }
     }
 #endif
@@ -303,6 +332,23 @@ needle_context_t *needle_open(const char *filepath, needle_config_t config) {
 
     grammar_init(&ctx->gctx, config.json_schema);
 
+    /* Verify file boundary safety before setting pointers */
+    size_t q_dim = hdr->n_heads * hdr->head_dim;
+    size_t kv_dim = hdr->n_kv_heads * hdr->head_dim;
+
+    size_t required_bytes = 128 +
+        (hdr->vocab_size * hdr->dim + hdr->engram_vocab_size * hdr->engram_dim) * sizeof(float) +
+        hdr->n_layers * (hdr->dim * q_dim + hdr->dim * kv_dim + hdr->dim * kv_dim + q_dim * hdr->dim + 5 * hdr->dim) * sizeof(float) +
+        (hdr->dim + hdr->dim) * sizeof(float);
+
+    if (file_size < required_bytes) {
+        fprintf(stderr, "[Needle 2] Error: Model file binary size (%zu) smaller than required header payload (%zu)\n", file_size, required_bytes);
+        munmap(ptr, file_size);
+        close(fd);
+        free(ctx);
+        return NULL;
+    }
+
     /* Set weights pointers directly into mmap memory */
     const float *curr = (const float *)((const uint8_t *)ptr + 128);
     ctx->weights.token_emb = curr;
@@ -310,9 +356,6 @@ needle_context_t *needle_open(const char *filepath, needle_config_t config) {
 
     ctx->weights.engram_tables = curr;
     curr += hdr->engram_vocab_size * hdr->engram_dim;
-
-    size_t q_dim = hdr->n_heads * hdr->head_dim;
-    size_t kv_dim = hdr->n_kv_heads * hdr->head_dim;
 
     ctx->weights.layers = malloc(hdr->n_layers * sizeof(*ctx->weights.layers));
 
@@ -322,9 +365,9 @@ needle_context_t *needle_open(const char *filepath, needle_config_t config) {
         ctx->weights.layers[l].v_proj = curr; curr += hdr->dim * kv_dim;
         ctx->weights.layers[l].o_proj = curr; curr += q_dim * hdr->dim;
 
-        ctx->weights.layers[l].mlp_gate = curr; curr += hdr->dim * hdr->dim;
-        ctx->weights.layers[l].mlp_up   = curr; curr += hdr->dim * hdr->dim;
-        ctx->weights.layers[l].mlp_down = curr; curr += hdr->dim * hdr->dim;
+        ctx->weights.layers[l].mlp_d1 = curr; curr += hdr->dim;
+        ctx->weights.layers[l].mlp_d2 = curr; curr += hdr->dim;
+        ctx->weights.layers[l].mlp_d3 = curr; curr += hdr->dim;
 
         ctx->weights.layers[l].norm_attn = curr; curr += hdr->dim;
         ctx->weights.layers[l].norm_mlp  = curr; curr += hdr->dim;
@@ -394,12 +437,55 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
             matmul(v, norm_x, ctx->weights.layers[l].v_proj, dim, kv_dim);
 
             /* Sliding Window KV Store */
-            size_t cache_idx = (l * NEEDLE_MAX_WINDOW + (ctx->cache_pos % NEEDLE_MAX_WINDOW)) * kv_dim;
+            size_t slot = ctx->cache_pos % NEEDLE_MAX_WINDOW;
+            size_t cache_idx = (l * NEEDLE_MAX_WINDOW + slot) * kv_dim;
             memcpy(&ctx->k_cache[cache_idx], k, kv_dim * sizeof(float));
             memcpy(&ctx->v_cache[cache_idx], v, kv_dim * sizeof(float));
 
-            /* Simplified GQA Attention */
-            memcpy(attn_out, q, q_dim * sizeof(float));
+            /* Scaled Dot-Product Grouped-Query Attention (GQA) over KV Cache */
+            size_t n_heads = ctx->header.n_heads;
+            size_t n_kv_heads = ctx->header.n_kv_heads;
+            size_t head_dim = ctx->header.head_dim;
+            size_t gqa_ratio = n_heads / n_kv_heads;
+            float scale = 1.0f / sqrtf((float)head_dim);
+
+            size_t valid_len = (ctx->cache_pos + 1 < NEEDLE_MAX_WINDOW) ? (ctx->cache_pos + 1) : NEEDLE_MAX_WINDOW;
+
+            for (size_t h = 0; h < n_heads; h++) {
+                size_t kv_h = h / gqa_ratio;
+                const float *qh = &q[h * head_dim];
+                float *oh = &attn_out[h * head_dim];
+                memset(oh, 0, head_dim * sizeof(float));
+
+                float scores[NEEDLE_MAX_WINDOW];
+                float max_score = -1e9f;
+
+                for (size_t t = 0; t < valid_len; t++) {
+                    const float *kt = &ctx->k_cache[(l * NEEDLE_MAX_WINDOW + t) * kv_dim + kv_h * head_dim];
+                    float dot = 0.0f;
+                    for (size_t d = 0; d < head_dim; d++) {
+                        dot += qh[d] * kt[d];
+                    }
+                    scores[t] = dot * scale;
+                    if (scores[t] > max_score) max_score = scores[t];
+                }
+
+                /* Softmax and Weighted Value Sum */
+                float sum_exp = 0.0f;
+                for (size_t t = 0; t < valid_len; t++) {
+                    scores[t] = expf(scores[t] - max_score);
+                    sum_exp += scores[t];
+                }
+                float inv_sum = 1.0f / (sum_exp + 1e-5f);
+
+                for (size_t t = 0; t < valid_len; t++) {
+                    float w_attn = scores[t] * inv_sum;
+                    const float *vt = &ctx->v_cache[(l * NEEDLE_MAX_WINDOW + t) * kv_dim + kv_h * head_dim];
+                    for (size_t d = 0; d < head_dim; d++) {
+                        oh[d] += w_attn * vt[d];
+                    }
+                }
+            }
 
             /* Output projection */
             matmul(proj_out, attn_out, ctx->weights.layers[l].o_proj, q_dim, dim);
@@ -408,19 +494,19 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
             /* MLP RMSNorm */
             rms_norm(norm_x, x, ctx->weights.layers[l].norm_mlp, dim);
 
-            /* Hadamard MLP */
-            matmul(gate, norm_x, ctx->weights.layers[l].mlp_gate, dim, dim);
-            matmul(up, norm_x, ctx->weights.layers[l].mlp_up, dim, dim);
+            /* Hadamard MLP: gate = norm_x * d1, up = norm_x * d2 */
+            for (size_t i = 0; i < dim; i++) {
+                gate[i] = norm_x[i] * ctx->weights.layers[l].mlp_d1[i];
+                up[i] = norm_x[i] * ctx->weights.layers[l].mlp_d2[i];
+            }
 
             /* Walsh-Hadamard Transform on gate */
             walsh_hadamard_transform(gate, dim);
 
             for (size_t i = 0; i < dim; i++) {
-                gate[i] = gate[i] * up[i];
+                mlp_out[i] = gate[i] * up[i] * ctx->weights.layers[l].mlp_d3[i];
+                x[i] += mlp_out[i];
             }
-
-            matmul(mlp_out, gate, ctx->weights.layers[l].mlp_down, dim, dim);
-            for (size_t i = 0; i < dim; i++) x[i] += mlp_out[i];
         }
 
         /* Final Norm */

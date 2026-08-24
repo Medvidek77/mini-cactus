@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
@@ -63,11 +64,17 @@ int main(int argc, char **argv) {
     needle_output_meta_t meta;
 
     printf("[Needle 2] Evaluating prompt: '%s'\n", prompt_text);
+    clock_t start_time = clock();
     int res = needle_eval(ctx, (const uint8_t *)prompt_text, prompt_len, out_buf, sizeof(out_buf) - 1, &meta);
+    clock_t end_time = clock();
+
+    double elapsed_sec = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+    double tps = (elapsed_sec > 0.0) ? (meta.generated_tokens / elapsed_sec) : 0.0;
 
     if (res == 0) {
         printf("[Needle 2] Output: %s\n", (char *)out_buf);
-        printf("[Needle 2] Generated tokens: %zu | Confidence: %.4f\n", meta.generated_tokens, meta.confidence);
+        printf("[Needle 2] Generated tokens: %zu | Time: %.3fs (%.2f tok/s) | Confidence: %.4f\n",
+               meta.generated_tokens, elapsed_sec, tps, meta.confidence);
     } else {
         fprintf(stderr, "Error during evaluation.\n");
     }

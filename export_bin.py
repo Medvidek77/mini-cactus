@@ -1,24 +1,8 @@
 #!/usr/bin/env python3
 """
-Needle 2 Model Exporter (Python stdlib to binary file format).
-Converts model weights and configuration into a contiguous, mmap-friendly binary blob (needle2.bin).
-
-Binary Layout:
-  1. Header (128 bytes)
-  2. Token Embeddings [vocab_size, dim] (float32)
-  3. Engram Hash Tables [engram_vocab_size, engram_dim] (float32)
-  4. Per-Layer Weights:
-     - q_proj [dim, n_heads * head_dim] (float32)
-     - k_proj [dim, n_kv_heads * head_dim] (float32)
-     - v_proj [dim, n_kv_heads * head_dim] (float32)
-     - o_proj [n_heads * head_dim, dim] (float32)
-     - mlp_gate [dim, dim] (float32)
-     - mlp_up   [dim, dim] (float32)
-     - mlp_down [dim, dim] (float32)
-     - norm_attn [dim] (float32)
-     - norm_mlp  [dim] (float32)
-  5. Final Norm [dim] (float32)
-  6. Confidence Head Weights [dim, 1] (float32)
+Needle 2 Model Exporter
+Converts model weights (.pkl / .cact / JAX checkpoint) into contiguous needle2.bin.
+Pure Python standard library implementation.
 """
 
 import os
@@ -29,84 +13,130 @@ import argparse
 MAGIC = b"NDL2"
 VERSION = 1
 
-def generate_float_array(count, scale=0.02, offset=0.0):
+def generate_floats(count, scale=0.02, offset=0.0):
     return [random.gauss(0.0, 1.0) * scale + offset for _ in range(count)]
 
 def pack_floats(arr):
     return struct.pack(f"<{len(arr)}f", *arr)
 
-def create_needle2_weights(filename="needle2.bin", dim=256, n_layers=4, n_heads=8, n_kv_heads=2, head_dim=32, vocab_size=256, engram_vocab_size=1024, engram_dim=64):
-    max_seq_len = 256
-
-    header_bytes = struct.pack(
+def generate_dummy_weights(output_bin="needle2.bin", dim=512, n_layers=4, n_heads=8, n_kv_heads=4, head_dim=64, vocab_size=8192, engram_vocab_size=8192, engram_dim=128):
+    max_seq_len = 2048
+    header = struct.pack(
         "<4sIIIIIIIIII",
-        MAGIC,
-        VERSION,
-        dim,
-        n_layers,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        vocab_size,
-        engram_vocab_size,
-        engram_dim,
-        max_seq_len
-    )
-    # Pad header to 128 bytes
-    header_bytes = header_bytes.ljust(128, b'\x00')
+        MAGIC, VERSION, dim, n_layers, n_heads, n_kv_heads,
+        head_dim, vocab_size, engram_vocab_size, engram_dim, max_seq_len
+    ).ljust(128, b'\x00')
+
+    q_dim = n_heads * head_dim
+    kv_dim = n_kv_heads * head_dim
 
     random.seed(42)
 
-    with open(filename, "wb") as f:
-        f.write(header_bytes)
-
-        # 1. Token Embeddings
-        token_emb = generate_float_array(vocab_size * dim, scale=0.02)
-        f.write(pack_floats(token_emb))
-
-        # 2. Engram Hash Tables
-        engram_tables = generate_float_array(engram_vocab_size * engram_dim, scale=0.02)
-        f.write(pack_floats(engram_tables))
-
-        # 3. Layer weights
-        q_dim = n_heads * head_dim
-        kv_dim = n_kv_heads * head_dim
+    with open(output_bin, "wb") as f:
+        f.write(header)
+        f.write(pack_floats(generate_floats(vocab_size * dim)))
+        f.write(pack_floats(generate_floats(engram_vocab_size * engram_dim)))
 
         for _ in range(n_layers):
-            q_proj = generate_float_array(dim * q_dim, scale=0.02)
-            k_proj = generate_float_array(dim * kv_dim, scale=0.02)
-            v_proj = generate_float_array(dim * kv_dim, scale=0.02)
-            o_proj = generate_float_array(q_dim * dim, scale=0.02)
+            f.write(pack_floats(generate_floats(dim * q_dim)))
+            f.write(pack_floats(generate_floats(dim * kv_dim)))
+            f.write(pack_floats(generate_floats(dim * kv_dim)))
+            f.write(pack_floats(generate_floats(q_dim * dim)))
 
-            mlp_gate = generate_float_array(dim * dim, scale=0.02)
-            mlp_up = generate_float_array(dim * dim, scale=0.02)
-            mlp_down = generate_float_array(dim * dim, scale=0.02)
+            f.write(pack_floats([1.0] * dim))
+            f.write(pack_floats([1.0] * dim))
+            f.write(pack_floats([1.0] * dim))
 
-            norm_attn = [1.0] * dim
-            norm_mlp = [1.0] * dim
+            f.write(pack_floats([1.0] * dim))
+            f.write(pack_floats([1.0] * dim))
 
-            f.write(pack_floats(q_proj))
-            f.write(pack_floats(k_proj))
-            f.write(pack_floats(v_proj))
-            f.write(pack_floats(o_proj))
-            f.write(pack_floats(mlp_gate))
-            f.write(pack_floats(mlp_up))
-            f.write(pack_floats(mlp_down))
-            f.write(pack_floats(norm_attn))
-            f.write(pack_floats(norm_mlp))
+        f.write(pack_floats([1.0] * dim))
+        f.write(pack_floats(generate_floats(dim)))
 
-        # 4. Final norm
-        final_norm = [1.0] * dim
-        f.write(pack_floats(final_norm))
+    print(f"[Export] Dummy binary model '{output_bin}' exported ({os.path.getsize(output_bin)} bytes)")
 
-        # 5. Confidence Head Weights
-        conf_head = generate_float_array(dim * 1, scale=0.02)
-        f.write(pack_floats(conf_head))
+def export_checkpoint(pkl_path, output_bin="needle2.bin"):
+    if not os.path.exists(pkl_path):
+        print(f"[*] Checkpoint '{pkl_path}' not found, generating dummy binary model...")
+        generate_dummy_weights(output_bin=output_bin)
+        return
 
-    print(f"[Export] Successfully generated binary model '{filename}' ({os.path.getsize(filename)} bytes)")
+    try:
+        import pickle
+        import numpy as np
+    except ImportError:
+        print("[!] numpy/pickle module missing. Falling back to dummy generator.")
+        generate_dummy_weights(output_bin=output_bin)
+        return
+
+    print(f"[*] Loading model checkpoint from '{pkl_path}'...")
+    with open(pkl_path, "rb") as f:
+        data = pickle.load(f)
+
+    cfg = data.get("config", {})
+    params = data.get("params", {})
+    stack = params.get("stack", {})
+    block = stack.get("layers", {}).get("block", {})
+    self_attn = block.get("self_attn", {})
+    mlp = block.get("hadamard_mlp", {})
+
+    dim = cfg.get("d_model", 512)
+    n_layers = cfg.get("num_layers", 27)
+    n_heads = cfg.get("num_heads", 8)
+    n_kv_heads = cfg.get("num_kv_heads", 4)
+    head_dim = dim // n_heads
+    vocab_size = cfg.get("vocab_size", 8192)
+    engram_vocab_size = cfg.get("engram_slots", 8192)
+    engram_dim = 128
+    max_seq_len = cfg.get("max_seq_len", 2048)
+
+    header = struct.pack(
+        "<4sIIIIIIIIII",
+        MAGIC, VERSION, dim, n_layers, n_heads, n_kv_heads,
+        head_dim, vocab_size, engram_vocab_size, engram_dim, max_seq_len
+    ).ljust(128, b'\x00')
+
+    def pack(arr):
+        return np.ascontiguousarray(arr, dtype=np.float32).tobytes()
+
+    with open(output_bin, "wb") as f:
+        f.write(header)
+
+        # 1. Token Embeddings [8192, 512]
+        emb = params["embedding"]["embedding"]
+        f.write(pack(emb))
+
+        # 2. Engram Hash Tables [8192, 128]
+        engram = params["engrams_0"]["embedding"][0]
+        f.write(pack(engram))
+
+        # 3. Layer weights
+        for i in range(n_layers):
+            f.write(pack(self_attn["q_proj"]["kernel"][i]))
+            f.write(pack(self_attn["k_proj"]["kernel"][i]))
+            f.write(pack(self_attn["v_proj"]["kernel"][i]))
+            f.write(pack(self_attn["out_proj"]["kernel"][i]))
+
+            f.write(pack(mlp["d1"][i]))
+            f.write(pack(mlp["d2"][i]))
+            f.write(pack(mlp["d3"][i]))
+
+            f.write(pack(block["pre_hada_norm"]["scale"][i]))
+            f.write(pack(block["post_attn_norm"]["scale"][i]))
+
+        # 4. Final Norm
+        f.write(pack(stack["final_norm"]["scale"]))
+
+        # 5. Confidence Head
+        conf_kernel = params.get("confidence_head", {}).get("proj", {}).get("kernel", np.zeros((dim, 1)))
+        f.write(pack(conf_kernel[:dim, :1]))
+
+    size_mb = os.path.getsize(output_bin) / (1024 * 1024)
+    print(f"[Export] '{output_bin}' exported successfully ({size_mb:.2f} MB)")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Export Needle 2 model to raw mmap binary file format.")
-    parser.add_argument("--output", type=str, default="needle2.bin", help="Output binary file path")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", default="needle2.pkl")
+    parser.add_argument("--output", default="needle2.bin")
     args = parser.parse_args()
-    create_needle2_weights(filename=args.output)
+    export_checkpoint(args.checkpoint, args.output)

@@ -19,8 +19,8 @@ LDFLAGS += -lvulkan
 endif
 endif
 
-SRCS = main.c needle.c grammar.c
-OBJS = main.o needle.o grammar.o
+SRCS = main.c needle.c grammar.c tokenizer.c
+OBJS = main.o needle.o grammar.o tokenizer.o
 TARGET = needle
 
 all: $(TARGET)
@@ -31,11 +31,14 @@ $(TARGET): $(OBJS)
 main.o: main.c needle.h
 	$(CC) $(CFLAGS) -c main.c -o main.o
 
-needle.o: needle.c needle.h grammar.h
+needle.o: needle.c needle.h grammar.h tokenizer.h
 	$(CC) $(CFLAGS) -c needle.c -o needle.o
 
 grammar.o: grammar.c grammar.h
 	$(CC) $(CFLAGS) -c grammar.c -o grammar.o
+
+tokenizer.o: tokenizer.c tokenizer.h
+	$(CC) $(CFLAGS) -c tokenizer.c -o tokenizer.o
 
 clean:
 	rm -f $(OBJS) $(TARGET)

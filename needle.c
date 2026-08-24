@@ -5,6 +5,7 @@
 
 #include "needle.h"
 #include "grammar.h"
+#include "tokenizer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -387,6 +388,14 @@ needle_context_t *needle_open(const char *filepath, needle_config_t config) {
     ctx->weights.final_norm = curr; curr += hdr->dim;
     ctx->weights.conf_head = curr;
 
+    /* Compute weight norm checksum for diagnostics */
+    float norm_sum = 0.0f;
+    for (size_t i = 0; i < 512 && i < hdr->dim; i++) {
+        norm_sum += ctx->weights.token_emb[i] * ctx->weights.token_emb[i];
+    }
+    printf("[Needle 2] Model header: dim=%u, layers=%u, vocab=%u | Emb Norm Checksum: %.6f\n",
+           hdr->dim, hdr->n_layers, hdr->vocab_size, sqrtf(norm_sum));
+
     /* Allocate sliding window KV cache */
     size_t total_kv_elements = hdr->n_layers * NEEDLE_MAX_WINDOW * kv_dim;
     ctx->k_cache = calloc(total_kv_elements, sizeof(float));
@@ -426,16 +435,29 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
     size_t gen_count = 0;
     float max_conf = 0.0f;
 
-    /* Single token evaluation helper function */
-    uint8_t current_token = 0;
+    /* Tokenize prompt using subword BPE tokenizer */
+    tokenizer_t tok;
+    tokenizer_init(&tok, ctx->vocab_table, ctx->header.vocab_size);
 
-    for (size_t step = 0; step < prompt_len + max_out_len; step++) {
-        if (step < prompt_len) {
-            current_token = prompt[step];
+    uint32_t prompt_tokens[NEEDLE_MAX_WINDOW];
+    size_t num_prompt_tokens = tokenizer_encode(&tok, (const char *)prompt, prompt_tokens, NEEDLE_MAX_WINDOW);
+    if (num_prompt_tokens == 0) {
+        num_prompt_tokens = prompt_len;
+        for (size_t p = 0; p < prompt_len && p < NEEDLE_MAX_WINDOW; p++) {
+            prompt_tokens[p] = (uint32_t)prompt[p];
+        }
+    }
+
+    uint32_t current_token_id = 0;
+
+    for (size_t step = 0; step < num_prompt_tokens + max_out_len; step++) {
+        if (step < num_prompt_tokens) {
+            current_token_id = prompt_tokens[step];
         }
 
-        /* Load Token Embedding */
-        memcpy(x, &ctx->weights.token_emb[current_token * dim], dim * sizeof(float));
+        /* Load Token Embedding for current_token_id */
+        if (current_token_id >= vocab_size) current_token_id = 0;
+        memcpy(x, &ctx->weights.token_emb[current_token_id * dim], dim * sizeof(float));
 
         /* Transformer Layer Loop */
         for (size_t l = 0; l < ctx->header.n_layers; l++) {
@@ -544,7 +566,7 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
         ctx->cache_pos++;
 
         /* Autoregressive generation phase after prompt prefill */
-        if (step >= prompt_len) {
+        if (step >= num_prompt_tokens) {
             /* Compute LM Head Logits: dot product of x[dim] with each row b of token_emb[vocab_size, dim] */
             for (size_t b = 0; b < vocab_size; b++) {
                 const float *emb_row = &ctx->weights.token_emb[b * dim];
@@ -588,11 +610,11 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
                 grammar_accept(&ctx->gctx, (uint8_t)best_token);
             }
 
-            current_token = (uint8_t)(best_token & 0xFF);
+            current_token_id = (uint32_t)best_token;
             if (gen_count < NEEDLE_MAX_OUTPUT_TOKENS && meta) {
-                meta->token_ids[gen_count] = (uint32_t)best_token;
+                meta->token_ids[gen_count] = current_token_id;
             }
-            out_buf[gen_count++] = current_token;
+            out_buf[gen_count++] = (uint8_t)(current_token_id & 0xFF);
 
             if (gen_count >= max_out_len || best_token == 0 || best_token == 2) {
                 break;

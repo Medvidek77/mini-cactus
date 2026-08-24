@@ -2,13 +2,11 @@ CC ?= cc
 CFLAGS ?= -O3 -Wall -Wextra -std=c99 -pedantic
 LDFLAGS = -lm
 
-# Auto-detect AVX2 on x86_64 host
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M),x86_64)
 CFLAGS += -mavx2 -mfma
 endif
 
-# Check Vulkan availability
 VK_EXISTS := $(shell pkg-config --exists vulkan 2>/dev/null && echo yes || echo no)
 ifeq ($(VK_EXISTS),yes)
 CFLAGS += -DHAS_VULKAN $(shell pkg-config --cflags vulkan)

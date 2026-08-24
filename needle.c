@@ -531,7 +531,31 @@ int needle_eval(needle_context_t *ctx, const uint8_t *prompt, size_t prompt_len,
 
         /* Autoregressive generation phase after prompt prefill */
         if (step >= prompt_len - 1) {
-            matmul(logits, x, ctx->weights.token_emb, dim, vocab_size);
+            /* Compute LM Head Logits: dot product of x[dim] with each row b of token_emb[vocab_size, dim] */
+            for (size_t b = 0; b < vocab_size; b++) {
+                const float *emb_row = &ctx->weights.token_emb[b * dim];
+                float sum = 0.0f;
+#if defined(__AVX2__)
+                __m256 vsum = _mm256_setzero_ps();
+                size_t i = 0;
+                for (; i + 7 < dim; i += 8) {
+                    __m256 vx = _mm256_loadu_ps(&x[i]);
+                    __m256 ve = _mm256_loadu_ps(&emb_row[i]);
+                    vsum = _mm256_fmadd_ps(vx, ve, vsum);
+                }
+                float tmp[8];
+                _mm256_storeu_ps(tmp, vsum);
+                sum = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+                for (; i < dim; i++) {
+                    sum += x[i] * emb_row[i];
+                }
+#else
+                for (size_t i = 0; i < dim; i++) {
+                    sum += x[i] * emb_row[i];
+                }
+#endif
+                logits[b] = sum;
+            }
 
             if (ctx->config.enable_grammar) {
                 grammar_mask_logits(&ctx->gctx, logits, vocab_size);
